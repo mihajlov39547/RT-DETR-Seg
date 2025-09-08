@@ -105,7 +105,7 @@ If you use this work, please cite:
 ```bibtex
 @software{rtdetrseg_2025,
   title        = {RT-DETR-Seg: Real-Time Detection Transformer with Segmentation},
-  author       = {<Your Name>},
+  author       = {Marko Mihajlovic},
   year         = {2025},
   url          = {https://github.com/mihajlov39547/rt-detr-seg}
 }
