@@ -144,7 +144,7 @@ def main():
         do_random_resize_via_padding=False,
         square_resize_div_64=(size in {"nano","small","medium"}),  # Base/Large use block size 56
         masks=False,                     # stage-1 detection only
-        early_stopping=False,            # not needed for a sanity run
+        early_stopping=True,            # not needed for a sanity run
         lr_scheduler="cosine",
         warmup_epochs=0,
         device=device,
