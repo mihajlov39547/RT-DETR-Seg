@@ -136,7 +136,7 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    dataset_dir = Path(r"C:\Users\Simbyot\Downloads\Kidney-Sliced-512").resolve()
+    dataset_dir = Path(r"/content/drive/MyDrive/RT-DETR-Seg/dataset").resolve()
     train_ann = dataset_dir / "train" / "_annotations.coco.json"
     if not train_ann.exists():
         raise FileNotFoundError(f"Missing annotations: {train_ann}")
