@@ -18,7 +18,7 @@ except Exception:
     pass
 
 # Make repo importable when running this file directly
-REPO_ROOT = Path(r"C:\Users\Simbyot\Downloads\Kidney-Sliced-512").resolve()
+REPO_ROOT = Path(r"/content/drive/MyDrive/RT-DETR-Seg").resolve()
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -102,7 +102,7 @@ def main():
     defaults = SIZE_DEFAULTS[size]
 
     # Relative paths (work on Windows/Colab/Linux)
-    dataset_dir = REPO_ROOT / "dataset.coco-segmentation"   # expects train/ valid/ test/ with _annotations.coco.json
+    dataset_dir = REPO_ROOT / "dataset"   # expects train/ valid/ test/ with _annotations.coco.json
     base_name = f"detector_{size}_{defaults['resolution']}"
     for i in count(1):
         candidate = REPO_ROOT / "runs" / f"{base_name}_{i}"
