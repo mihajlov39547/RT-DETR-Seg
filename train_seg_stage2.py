@@ -184,9 +184,9 @@ def main():
         class_names=class_names,
         aux_loss=True,  # enable decoder aux supervision for seg
         num_queries=_get("num_queries", args.num_queries),
-        out_feature_indexes=_get("out_feature_indexes", None),
-        projector_scale=_get("projector_scale", None),
-        position_embedding=_get("position_embedding", None),
+        # out_feature_indexes=_get("out_feature_indexes", None),
+        # projector_scale=_get("projector_scale", None),
+        # position_embedding=_get("position_embedding", None),
         multi_scale=bool(args.multi_scale),
         expanded_scales=bool(args.expanded_scales),
     )
