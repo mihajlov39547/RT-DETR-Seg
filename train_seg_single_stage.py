@@ -160,6 +160,7 @@ def main():
         early_stopping_use_ema=False,
         # misc
         seed=args.seed,
+        use_ema=False
     )
 
     print(f"==> Single-stage seg training (unfrozen) on {args.device} | size={args.size} | res={args.resolution}")
