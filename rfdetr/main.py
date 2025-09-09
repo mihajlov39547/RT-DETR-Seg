@@ -306,7 +306,24 @@ class Model:
             gg["params"] = params
             filtered_groups.append(gg)
 
-        param_dicts = filtered_groups
+            param_dicts = filtered_groups
+
+            # --- De-duplicate parameters across groups (keep the first group's hyperparams) ---
+            seen = set()
+            deduped = []
+            for g in param_dicts:
+                params = []
+                for p in g["params"]:
+                    pid = id(p)
+                    if pid in seen:
+                        continue
+                    seen.add(pid)
+                    params.append(p)
+                if params:
+                    gg = {k: v for k, v in g.items() if k != "params"}
+                    gg["params"] = params
+                    deduped.append(gg)
+            param_dicts = deduped
 
         optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
         # Choose the learning rate scheduler based on the new argument
