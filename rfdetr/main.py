@@ -260,9 +260,7 @@ class Model:
         # Decide freeze intent once
         freeze_intent = bool(getattr(args, "masks", False) and getattr(args, "frozen_weights", None))
 
-        # Stage-2: ensure no aux losses in args BEFORE building criterion
-        if freeze_intent:
-            args.aux_loss = False
+        # Keep user/configured aux_loss as-is (needed for seg to learn across decoder layers)
 
         model = self.model
         model.to(device)
@@ -272,9 +270,7 @@ class Model:
             print("[fixup] Wrapping detector with DETRsegm (masks=True).")
             model = DETRsegm(model, freeze_detr=freeze_intent).to(device)
 
-        # Also disable aux decodes on the inner DETR
-        if hasattr(model, "detr") and hasattr(model.detr, "aux_loss"):
-            model.detr.aux_loss = False
+        # Keep model.detr.aux_loss unchanged; Stage-2 relies on aux supervision
 
         model_without_ddp = model
 

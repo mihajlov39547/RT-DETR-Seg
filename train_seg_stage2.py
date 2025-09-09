@@ -112,8 +112,10 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
 
     # Loss weights
-    p.add_argument("--mask_loss_coef", type=float, default=1.0)
-    p.add_argument("--dice_loss_coef", type=float, default=1.0)
+    p.add_argument("--mask_loss_coef", type=float, default=2.0)
+    p.add_argument("--dice_loss_coef", type=float, default=2.0)
+    p.add_argument("--freeze", type=int, default=1,
+               help="1 = freeze detector (mask head only), 0 = train detector + mask head")
     p.add_argument("--cls_loss_coef", type=float, default=1.0)
     p.add_argument("--bbox_loss_coef", type=float, default=5.0)
     p.add_argument("--giou_loss_coef", type=float, default=2.0)
@@ -154,6 +156,7 @@ def main():
     try:
         ckpt = torch.load(args.stage1_ckpt, map_location="cpu", weights_only=False)
         state = ckpt.get("model") or ckpt.get("ema_model") or {}
+        ckpt_args = ckpt.get("args", None)
         cls_bias_key = next((k for k in state.keys() if k.endswith("class_embed.bias")), None)
         if cls_bias_key is not None:
             ckpt_out = int(state[cls_bias_key].shape[0])   # includes background
@@ -167,20 +170,28 @@ def main():
 
     # Build base RF-DETR
     ModelCls = SIZES[args.size]
+    # decide freezing: only freeze if --freeze=1
+    _frozen = args.stage1_ckpt if args.freeze == 1 else None
+    # prefer Stage-1 architecture settings when present
+    def _get(k, default):
+        return getattr(ckpt_args, k, default) if ckpt_args is not None else default
     model = ModelCls(
-        resolution=args.resolution,
+        resolution=_get("resolution", args.resolution),
         masks=True,
-        frozen_weights=args.stage1_ckpt,
+        frozen_weights=_frozen,
         device=args.device,
         num_classes=num_classes,
         class_names=class_names,
-        aux_loss=False,
-        num_queries=args.num_queries,
+        aux_loss=True,  # enable decoder aux supervision for seg
+        num_queries=_get("num_queries", args.num_queries),
+        out_feature_indexes=_get("out_feature_indexes", None),
+        projector_scale=_get("projector_scale", None),
+        position_embedding=_get("position_embedding", None),
         multi_scale=bool(args.multi_scale),
         expanded_scales=bool(args.expanded_scales),
     )
 
-    freeze_intent = True
+    freeze_intent = (args.freeze == 1)
     inner = model.model.model
     if not isinstance(inner, DETRsegm):
         print("[stage-2] Wrapping base detector with DETRsegm.")
@@ -200,7 +211,7 @@ def main():
         tensorboard=args.tensorboard,
         use_ema=args.ema,
         run_test=args.run_test and (not args.eval_only),
-        aux_loss=False,
+        aux_loss=True,
         # losses
         cls_loss_coef=args.cls_loss_coef,
         bbox_loss_coef=args.bbox_loss_coef,
@@ -208,7 +219,7 @@ def main():
         mask_loss_coef=args.mask_loss_coef,
         dice_loss_coef=args.dice_loss_coef,
         masks=True,
-        frozen_weights=args.stage1_ckpt,
+        frozen_weights=_frozen,
         class_names=class_names,
         square_resize_div_64=True,
         # keep lightweight by default
