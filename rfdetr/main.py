@@ -169,16 +169,10 @@ class Model:
                 for k in set(to_drop):
                     state.pop(k, None)
 
-            if getattr(args, "pretrain_keys_modify_to_load", None):
-                from rfdetr.util.obj365_to_coco_model import get_coco_pretrain_from_obj365
-                cur_sd = self.model.state_dict()
-                assert isinstance(args.pretrain_keys_modify_to_load, list)
-                for k in args.pretrain_keys_modify_to_load:
-                    try:
-                        state[k] = get_coco_pretrain_from_obj365(cur_sd[k], state[k])
-                    except Exception:
-                        print(f"Failed to adapt {k}, removing from checkpoint")
-                        state.pop(k, None)
+            # Object365 to COCO model conversion removed (not using Object365 dataset)
+            # if getattr(args, "pretrain_keys_modify_to_load", None):
+            #     from rfdetr.util.obj365_to_coco_model import get_coco_pretrain_from_obj365
+            #     ...
 
             # Resize query params if group_detr differs
             num_desired_queries = args.num_queries * args.group_detr

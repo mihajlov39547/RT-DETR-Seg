@@ -95,7 +95,7 @@ def parse_args():
     # Init weights
     p.add_argument("--pretrain_weights", type=str, default=None,
                    help="COCO RF-DETR weights filename or path (auto-download if known name, default: rf-detr-<size>.pth)")
-    p.add_argument("--pretrain_exclude_keys", type=str, default="backbone.0.projector.*",
+    p.add_argument("--pretrain_exclude_keys", type=str, nargs='+', default=["backbone.0.projector.*"],
                    help="Keys to exclude when loading pretrain weights (default: projector)")
     p.add_argument("--init_ckpt", type=str, default="",
                    help="Optional: path to your own detector/seg checkpoint to initialize from (NOT frozen).")
