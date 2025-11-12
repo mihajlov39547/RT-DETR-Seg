@@ -21,10 +21,13 @@ python shrink_head.py --in_ckpt runs/detector_nano_384_1/checkpoint_best_regular
 
 **Stage 2 - Train Segmentation (1 epoch test):**
 ```powershell
-python train_seg_stage2.py --size nano --stage1_run runs/detector_nano_384_1 --checkpoint runs/detector_nano_384_1/checkpoint_mydata.pth --epochs 1 --batch 4 --accum 2 --workers 2 --multi_scale 0 --run_test 0
+python train_seg_stage2.py --size nano --stage1_run runs/detector_nano_384_1 --checkpoint runs/detector_nano_384_1/checkpoint_mydata.pth --epochs 1 --batch 1 --accum 8 --workers 2 --multi_scale 0 --run_test 0
 ```
 
-**💡 Tip:** Use `--batch 4` for Stage 2 to get **10-15x faster training** than batch=1! If OOM, reduce to `--batch 2`.
+**💡 GPU Memory Tips:** 
+- **4GB GPU (GTX 1650 Ti)**: Must use `--batch 1 --accum 8`
+- **6GB GPU**: Can use `--batch 2 --accum 4` (2x faster)
+- **8GB+ GPU**: Can use `--batch 4 --accum 2` (4x faster)
 
 ---
 
@@ -164,8 +167,8 @@ python train_seg_stage2.py `
     --stage1_run runs/detector_nano_384_1 `
     --checkpoint runs/detector_nano_384_1/checkpoint_mydata.pth `
     --epochs 1 `
-    --batch 4 `
-    --accum 2 `
+    --batch 1 `
+    --accum 8 `
     --workers 2 `
     --seg_lr 0.0001 `
     --multi_scale 0 `
@@ -177,19 +180,22 @@ python train_seg_stage2.py `
 - `--stage1_run runs/detector_nano_384_1` - Path to Stage 1 output directory
 - `--checkpoint runs/detector_nano_384_1/checkpoint_mydata.pth` - **Use the shrunken checkpoint from shrink_head.py**
 - `--epochs 1` - Single epoch for quick testing
-- `--batch 4` - **Higher batch size for faster training** (10-15x speedup vs batch=1!)
-- `--accum 2` - Gradient accumulation (effective batch = 4 × 2 = 8)
+- `--batch 1` - **Required for 4GB GPUs** (GTX 1650 Ti, RTX 3050 4GB)
+- `--accum 8` - Higher accumulation for effective batch size of 8
 - `--workers 2` - Parallel data loading for speed
 - `--seg_lr 0.0001` - Lower learning rate for fine-tuning segmentation head
 - `--multi_scale 0` - Disable for faster testing
 - `--run_test 0` - Skip test evaluation to save time
 
-**💡 Performance Tip:** Stage 2 uses optimized `MaskHeadNano` for nano models (75% fewer parameters). Combined with batch=4, this gives **10-15x faster training** compared to batch=1!
+**💡 Performance Tip:** Stage 2 uses optimized `MaskHeadNano` for nano models (75% fewer parameters, much faster than MaskHeadSmallConv).
 
-**If OOM (Out of Memory):**
+**For GPUs with more VRAM:**
 ```powershell
-# Reduce batch to 2 (still 2x faster than batch=1)
+# 6GB GPU (2x faster)
 python train_seg_stage2.py ... --batch 2 --accum 4 ...
+
+# 8GB+ GPU (4x faster)
+python train_seg_stage2.py ... --batch 4 --accum 2 ...
 ```
 
 #### Expected Output:
@@ -248,18 +254,21 @@ python -c "import torch; ckpt = torch.load('runs/segmentation_nano_384_1/stage2_
 ## Troubleshooting
 
 ### Issue: "Stage 2 training extremely slow (days for 1 epoch)"
-**Cause**: Batch size too small (batch=1) with large dataset.
+**Cause**: Segmentation training is computationally expensive, especially with large datasets.
 
-**Solution**: Increase batch size for massive speedup:
+**Solutions by GPU:**
 ```powershell
-# Try batch=4 first (10-15x faster!)
---batch 4 --accum 2 --workers 2
+# 4GB GPU (GTX 1650 Ti, RTX 3050 4GB) - Use batch=1
+--batch 1 --accum 8 --workers 2
 
-# If OOM, use batch=2 (still 2x faster)
+# 6GB GPU (GTX 1660, RTX 3050 6GB) - Use batch=2 (2x faster)
 --batch 2 --accum 4 --workers 2
+
+# 8GB+ GPU (RTX 3060, RTX 3070) - Use batch=4 (4x faster)
+--batch 4 --accum 2 --workers 2
 ```
 
-**Why this works:** Nano models use optimized `MaskHeadNano` with 75% fewer parameters. Higher batch sizes process more images in parallel, dramatically reducing training time.
+**Why this helps:** Nano models use optimized `MaskHeadNano` with 75% fewer parameters. Higher batch sizes (when GPU allows) process more images in parallel, reducing total iterations.
 
 ### Issue: "Frozen detector head out_dim (91) != requested (4)"
 **Cause**: Stage 1 checkpoint has 91 classes (COCO pretrained) but your dataset has fewer classes.
@@ -330,8 +339,8 @@ python train_seg_stage2.py `
     --stage1_run runs/detector_nano_384_1 `
     --checkpoint runs/detector_nano_384_1/checkpoint_mydata.pth `
     --epochs 50 `
-    --batch 4 `
-    --accum 2 `
+    --batch 1 `
+    --accum 8 `
     --workers 2 `
     --seg_lr 0.0001 `
     --multi_scale 1 `
@@ -340,7 +349,11 @@ python train_seg_stage2.py `
     --run_test 1
 ```
 
-**💡 Optimization Note:** Nano models automatically use lightweight `MaskHeadNano` (75% fewer parameters). Use `--batch 4` for best performance (10-15x faster than batch=1).
+**💡 GPU-Specific Settings:** 
+- **4GB GPU**: `--batch 1 --accum 8` (shown above)
+- **6GB GPU**: `--batch 2 --accum 4` (2x faster)
+- **8GB+ GPU**: `--batch 4 --accum 2` (4x faster)
+- **Automatic optimization**: Nano models use `MaskHeadNano` (75% fewer parameters)
 
 ---
 
@@ -423,12 +436,12 @@ python shrink_head.py --in_ckpt runs/detector_nano_384_1/checkpoint_best_regular
 
 **3. Train Segmentation Head (Stage 2 - OPTIMIZED):**
 ```powershell
-python train_seg_stage2.py --size nano --stage1_run runs/detector_nano_384_1 --checkpoint runs/detector_nano_384_1/checkpoint_mydata.pth --epochs 1 --batch 4 --accum 2 --workers 2 --multi_scale 0 --run_test 0
+python train_seg_stage2.py --size nano --stage1_run runs/detector_nano_384_1 --checkpoint runs/detector_nano_384_1/checkpoint_mydata.pth --epochs 1 --batch 1 --accum 8 --workers 2 --multi_scale 0 --run_test 0
 ```
 
-All three steps should complete in **15-20 minutes** on a modest GPU (GTX 1650 Ti or better).
+All three steps should complete in **20-40 minutes** on a 4GB GPU (GTX 1650 Ti).
 
 **⚠️ Critical Tips:**
 - **Don't skip shrink_head.py!** Without it, you'll get a dimension mismatch error in Stage 2
-- **Use batch=4 for Stage 2!** This gives 10-15x speedup compared to batch=1
-- **Nano models automatically use MaskHeadNano** (75% fewer parameters, much faster training)
+- **4GB GPU requires batch=1** (6GB+ can use batch=2 or 4 for faster training)
+- **Nano models automatically use MaskHeadNano** (75% fewer parameters, optimized for speed)

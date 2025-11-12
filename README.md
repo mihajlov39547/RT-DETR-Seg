@@ -204,11 +204,12 @@ Checks:
 - **8GB+ GPU**: Medium/base models with batch=2-4
 
 ### Stage 2 Performance Tips
-- **Batch size is critical**: Stage 2 is much slower with batch=1
-  - Nano models: Try `--batch 4` first (4x faster than batch=1)
-  - If OOM: Use `--batch 2` (still 2x faster)
+- **Batch size depends on GPU memory**:
+  - **4GB GPU (GTX 1650 Ti)**: Must use `--batch 1 --accum 8`
+  - **6GB GPU**: Can use `--batch 2 --accum 4` (2x faster than batch=1)
+  - **8GB+ GPU**: Can use `--batch 4 --accum 2` (4x faster than batch=1)
 - **Automatic optimization**: Nano models use lightweight `MaskHeadNano` (75% fewer parameters)
-- **Expected speed**: Stage 2 should take similar time to Stage 1 with proper batch size
+- **Expected speed**: With MaskHeadNano, Stage 2 takes similar time to Stage 1 per epoch
 - **Workers**: Use `--workers 2` for parallel data loading (faster than `--workers 0`)
 
 ### Data Augmentation
@@ -237,17 +238,24 @@ Checks:
 
 ### Issue: "Stage 2 training extremely slow (8+ days)"
 
-**Cause:** Batch size too small (batch=1) with large dataset.
+**Cause:** Large dataset with segmentation training (computationally expensive).
 
-**Solution:** Increase batch size for massive speedup:
+**Solution:** Use optimized settings based on your GPU:
 ```bash
-# Try batch=4 first (recommended for nano with 4GB GPU)
-python train_seg_stage2.py --size nano --batch 4 --accum 2 ...
+# 4GB GPU (GTX 1650 Ti, RTX 3050 4GB)
+python train_seg_stage2.py --size nano --batch 1 --accum 8 --workers 2 ...
 
-# If OOM, use batch=2 (still 2x faster)
-python train_seg_stage2.py --size nano --batch 2 --accum 4 ...
+# 6GB GPU (GTX 1660, RTX 3050 6GB) - 2x faster
+python train_seg_stage2.py --size nano --batch 2 --accum 4 --workers 2 ...
+
+# 8GB+ GPU (RTX 3060+) - 4x faster  
+python train_seg_stage2.py --size nano --batch 4 --accum 2 --workers 2 ...
 ```
-**Speed improvement:** batch=4 gives ~10-15x faster training than batch=1!
+
+**Key optimizations:**
+- Nano models automatically use `MaskHeadNano` (75% fewer parameters)
+- Higher batch sizes dramatically reduce iterations (when GPU allows)
+- With 4,950 images: batch=1 = 619 iterations, batch=2 = 310 iterations, batch=4 = 155 iterations
 
 ### Issue: "Frozen detector head out_dim mismatch"
 
