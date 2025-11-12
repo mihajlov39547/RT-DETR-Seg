@@ -11,86 +11,363 @@ Real-Time Detection Transformer with **Instance Segmentation** — a lightweight
 - 🎯 **Two‑stage training**:  
   1) Train detector (boxes + classes)  
   2) Freeze detector, train mask head (instance segmentation)
-- 🧰 **Utilities**: `shrink_head.py`, ready-made training scripts, checkpoint tools.
-- 📦 **Pretrained weights** provided (tracked with Git LFS).
-- 🧪 COCO‑style datasets (boxes + polygons/RLE).
+- 🧰 **Utilities**: `shrink_head.py`, `strip_class_heads.py`, ready-made training scripts, checkpoint tools.
+- 📦 **Pretrained weights** provided (auto-download from hosted storage).
+- 🧪 COCO‑style datasets (boxes + polygons/RLE for segmentation).
 
 ---
 
-## Quickstart
+## Quick Start
 
-### 1) Install
+### 1) Setup Environment
+
+**Windows (PowerShell):**
+```powershell
+# Create virtual environment
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+
+# Install dependencies
+pip install --upgrade pip setuptools wheel
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+
+# Validate setup
+python validate_setup.py
+```
+
+**Linux/Mac:**
 ```bash
-git clone https://github.com/mihajlov39547/rt-detr-seg.git
-cd rt-detr-seg
-python -m venv detr-env && source detr-env/bin/activate   # on Windows: detr-env\Scripts\activate
-pip install -U pip
-pip install -e .
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install --upgrade pip setuptools wheel
+pip install torch torchvision torchaudio
+pip install -r requirements.txt
+
+# Validate setup
+python validate_setup.py
 ```
 
-> If you use the included `.pth` checkpoints, enable **Git LFS** first:
-```bash
-git lfs install
-git lfs track "*.pth"
-git add .gitattributes && git commit -m "track weights with LFS"
+### 2) Prepare Dataset
+
+Use COCO-format JSON with this structure:
+```
+dataset/
+├── train/
+│   ├── _annotations.coco.json
+│   └── *.jpg (images)
+├── valid/
+│   ├── _annotations.coco.json
+│   └── *.jpg (images)
+└── test/ (optional)
+    ├── _annotations.coco.json
+    └── *.jpg (images)
 ```
 
-### 2) Data
-Use COCO-style JSON (instances). Update dataset paths in your config/args.
-Common layout:
-```
-datasets/
-  your_dataset/
-    annotations/
-      instances_train.json
-      instances_val.json
-    images/
-      train/
-      val/
-```
+**Requirements:**
+- **Stage 1 (Detection)**: Bounding boxes (`bbox` field)
+- **Stage 2 (Segmentation)**: Bounding boxes + segmentation masks (`segmentation` field with polygons or RLE)
 
 ### 3) Train
 
-**Stage 1 — Detection**
+#### **Stage 1 — Detection (Train Detector)**
+
 ```bash
-python train_detector_stage1.py   --size small   --data datasets/your_dataset   --epochs 300   --output_dir runs/det_small   --imgsz 512   --batch 8
+python train_detector_stage1.py \
+    --size nano \
+    --epochs 50 \
+    --batch 4 \
+    --accum 4 \
+    --workers 2 \
+    --multi_scale 1
 ```
 
-**Stage 2 — Segmentation**
+**Output:** `runs/detector_nano_384_1/checkpoint_best_regular.pth`
+
+**Note:** The pretrained checkpoint has 91 classes (COCO), but your dataset likely has different classes. The projector weights are excluded by default to allow proper transfer learning.
+
+#### **Prepare Checkpoint for Stage 2**
+
+After Stage 1 completes, you need to shrink the detection head to match your dataset's classes:
+
 ```bash
-python train_seg_stage2.py   --size small   --stage1_ckpt runs/det_small/checkpoint_best.pth   --data datasets/your_dataset   --epochs 150   --output_dir runs/seg_small   --imgsz 512   --batch 4
+python shrink_head.py \
+    --in_ckpt runs/detector_nano_384_1/checkpoint_best_regular.pth \
+    --out_ckpt runs/detector_nano_384_1/checkpoint_mydata.pth \
+    --keep "class1" "class2" "class3"
 ```
 
-### 4) Inference (example)
+**Example:**
+```bash
+# For a dataset with 3 classes: cells, blood_vessel, glomerulus
+python shrink_head.py \
+    --in_ckpt runs/detector_nano_384_1/checkpoint_best_regular.pth \
+    --out_ckpt runs/detector_nano_384_1/checkpoint_3class.pth \
+    --keep "cells" "blood_vessel" "glomerulus"
+```
+
+This creates a checkpoint with the correct number of output classes (your classes + background).
+
+#### **Stage 2 — Segmentation (Train Mask Head)**
+
+```bash
+python train_seg_stage2.py \
+    --size nano \
+    --stage1_run runs/detector_nano_384_1 \
+    --checkpoint runs/detector_nano_384_1/checkpoint_3class.pth \
+    --epochs 50 \
+    --batch 2 \
+    --accum 4 \
+    --workers 2 \
+    --seg_lr 0.0001 \
+    --multi_scale 1
+```
+
+**Output:** `runs/segmentation_nano_384_1/checkpoint_best_regular.pth` (full model with segmentation)
+
+**What Happens:**
+- Loads the shrunken Stage 1 checkpoint
+- **Freezes detector** weights (537 params frozen)
+- Trains **only segmentation head** (~26 trainable params for nano)
+- Outputs instance segmentation masks
+
+---
+
+## Model Sizes
+
+| Model  | Params | Resolution | Batch (4GB GPU) | Speed | Use Case |
+|--------|--------|------------|-----------------|-------|----------|
+| Nano   | ~3M    | 384        | 4-8             | ⚡⚡⚡ | Edge devices, real-time |
+| Small  | ~9M    | 512        | 2-4             | ⚡⚡   | Balanced speed/accuracy |
+| Medium | ~16M   | 576        | 1-2             | ⚡     | Higher accuracy |
+| Base   | ~29M   | 560        | 1               | ⚡     | Production quality |
+| Large  | ~43M   | 560        | 1 (+ accum)     | 🐢     | Maximum accuracy |
+
+---
+
+## Utilities
+
+### `shrink_head.py`
+
+Reduces the detection head output dimension to match your dataset's classes. **Required** after Stage 1 before running Stage 2.
+
+```bash
+python shrink_head.py \
+    --in_ckpt <input_checkpoint.pth> \
+    --out_ckpt <output_checkpoint.pth> \
+    --keep "class1" "class2" "class3"
+```
+
+**When to use:**
+- After Stage 1 training, before Stage 2
+- When your dataset has fewer classes than the pretrained model
+- To create a checkpoint compatible with Stage 2 frozen training
+
+### `strip_class_heads.py`
+
+Removes all classification head weights from a checkpoint. Useful for transfer learning when you want to completely retrain the classification layers.
+
+```bash
+python strip_class_heads.py <input_checkpoint.pth> <output_checkpoint.pth>
+```
+
+**When to use:**
+- Transfer learning to completely different domains
+- When class mismatch errors occur and you want to start fresh
+- Creating backbone-only checkpoints
+
+### `validate_setup.py`
+
+Validates your environment, dependencies, and dataset before training.
+
+```bash
+python validate_setup.py
+```
+
+Checks:
+- ✓ Python version (3.8+)
+- ✓ PyTorch & CUDA availability
+- ✓ Required dependencies
+- ✓ Dataset structure and annotations
+- ✓ Segmentation masks presence (for Stage 2)
+
+---
+
+## Training Tips
+
+### Memory Management
+- **OOM errors**: Reduce `--batch` to 1, increase `--accum` for gradient accumulation
+- **4GB GPU**: Use nano/small models, batch=1, accum=4+, disable EMA
+- **8GB+ GPU**: Medium/base models with batch=2-4
+
+### Stage 2 Performance Tips
+- **Batch size is critical**: Stage 2 is much slower with batch=1
+  - Nano models: Try `--batch 4` first (4x faster than batch=1)
+  - If OOM: Use `--batch 2` (still 2x faster)
+- **Automatic optimization**: Nano models use lightweight `MaskHeadNano` (75% fewer parameters)
+- **Expected speed**: Stage 2 should take similar time to Stage 1 with proper batch size
+- **Workers**: Use `--workers 2` for parallel data loading (faster than `--workers 0`)
+
+### Data Augmentation
+- Start with `--multi_scale 0` for stability
+- Enable `--multi_scale 1` after initial convergence
+- Use `--expanded_scales 1` for more aggressive augmentation (large datasets only)
+
+### Learning Rates
+- **Stage 1 (Detector)**: Default LR (typically 5e-5 for nano)
+- **Stage 2 (Segmentation)**: Lower LR (`--seg_lr 1e-4`) since detector is frozen
+
+### Resolution Guidelines
+- **384px**: Fast, good for large objects (nano default)
+- **512px**: Balanced (small/medium default)
+- **560-576px**: Better for small objects (base/large default)
+- **Higher**: Increase if objects <32px in original images
+
+### Early Stopping
+- Enabled by default with patience=10
+- Monitors validation mAP
+- Stops if no improvement for N epochs
+
+---
+
+## Common Issues & Solutions
+
+### Issue: "Stage 2 training extremely slow (8+ days)"
+
+**Cause:** Batch size too small (batch=1) with large dataset.
+
+**Solution:** Increase batch size for massive speedup:
+```bash
+# Try batch=4 first (recommended for nano with 4GB GPU)
+python train_seg_stage2.py --size nano --batch 4 --accum 2 ...
+
+# If OOM, use batch=2 (still 2x faster)
+python train_seg_stage2.py --size nano --batch 2 --accum 4 ...
+```
+**Speed improvement:** batch=4 gives ~10-15x faster training than batch=1!
+
+### Issue: "Frozen detector head out_dim mismatch"
+
+**Cause:** Stage 1 checkpoint has different number of classes than your dataset.
+
+**Solution:** Use `shrink_head.py` to match classes:
+```bash
+python shrink_head.py \
+    --in_ckpt runs/detector_nano_384_1/checkpoint_best_regular.pth \
+    --out_ckpt runs/detector_nano_384_1/checkpoint_mydata.pth \
+    --keep "your" "class" "names"
+```
+
+### Issue: "No segmentation masks found"
+
+**Cause:** COCO JSON missing `segmentation` field for Stage 2.
+
+**Solution:** Ensure your annotations include polygon/RLE masks. Stage 2 requires instance segmentation annotations, not just bounding boxes.
+
+### Issue: "size mismatch for backbone.0.projector"
+
+**Cause:** Pretrained projector doesn't match your model configuration.
+
+**Solution:** Already handled automatically - projector weights are excluded by default (`--pretrain_exclude_keys "backbone.0.projector.*"`).
+
+### Issue: Out of memory (OOM)
+
+**Solutions:**
+1. Reduce batch size: `--batch 1`
+2. Increase gradient accumulation: `--accum 8`
+3. Disable EMA: Add `use_ema=False` in model config
+4. Lower resolution: Try smaller model size
+5. Reduce workers: `--workers 0`
+
+---
+
+## Monitoring Training
+
+### TensorBoard
+
+```bash
+# Stage 1
+tensorboard --logdir runs/detector_nano_384_1/tb
+
+# Stage 2
+tensorboard --logdir runs/segmentation_nano_384_1/tb
+```
+
+Open http://localhost:6006/
+
+**Metrics to watch:**
+- Total loss (should decrease steadily)
+- mAP@50 (main detection metric)
+- Mask loss & Dice loss (Stage 2)
+- Learning rate schedule
+
+### Weights & Biases (Optional)
+
+Enable in training scripts with `--wandb` flag and set `WANDB_API_KEY` environment variable.
+
+---
+
+## Inference Example
+
 ```python
-from rfdetr import load_model
-import torch, cv2
+from rfdetr.detr import RFDETRNano
+import cv2
+import torch
 
-model = load_model("rf-detr-small.pth", task="seg")  # or "det"
-img = cv2.imread("demo.jpg")[:, :, ::-1]  # BGR->RGB
+# Load trained model
+model = RFDETRNano(
+    pretrain_weights="runs/segmentation_nano_384_1/checkpoint_best_regular.pth",
+    num_classes=3,
+    class_names=["cells", "blood_vessel", "glomerulus"],
+    masks=True  # For segmentation
+)
+
+# Prepare image
+image = cv2.imread("test.jpg")
+image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+# Run inference
 with torch.no_grad():
-    outputs = model.predict([img], conf=0.25)
-# outputs: boxes / masks / scores / classes
+    predictions = model.predict([image], threshold=0.5)
+
+# predictions contains:
+# - boxes: [N, 4] bounding boxes
+# - scores: [N] confidence scores  
+# - class_ids: [N] class indices
+# - masks: [N, H, W] binary masks (if masks=True)
 ```
 
 ---
 
-## Repo Structure
-```
-rfdetr/                 # library code
-train_detector_stage1.py
-train_seg_stage2.py
-shrink_head.py
-runs/                   # logs & checkpoints
-docs/                   # docs & examples
-```
+## File Structure
 
----
-
-## Tips
-- **Resolution**: 512×512 is a good starting point; increase if objects are small.
-- **Augmentations**: start conservative for stability; ramp up after first baseline.
-- **GPU Memory**: lower `--imgsz` or `--batch` if you hit OOM.
+```
+c:\Projects\RT-DETR-Seg/
+├── rfdetr/                          # Core library
+│   ├── models/                      # Model architectures
+│   │   ├── segmentation.py         # DETRsegm wrapper
+│   │   ├── backbone/               # Backbone (DINOv2 variants)
+│   │   └── ...
+│   ├── datasets/                    # Data loaders
+│   ├── util/                        # Utilities
+│   ├── detr.py                     # Model wrappers
+│   ├── main.py                     # Core training logic
+│   └── config.py                   # Model configurations
+├── train_detector_stage1.py        # Stage 1 training script
+├── train_seg_stage2.py             # Stage 2 training script
+├── train_seg_single_stage.py       # End-to-end alternative
+├── shrink_head.py                  # Checkpoint class reduction
+├── strip_class_heads.py            # Remove classification heads
+├── validate_setup.py               # Pre-training validation
+├── requirements.txt                # Python dependencies
+├── QUICK_START_GUIDE.md           # Detailed guide
+└── runs/                          # Training outputs
+    ├── detector_nano_384_1/       # Stage 1 results
+    └── segmentation_nano_384_1/   # Stage 2 results
+```
 
 ---
 
@@ -114,3 +391,5 @@ If you use this work, please cite:
 ## Acknowledgements
 - Built upon DETR family and RF‑DETR ideas.
 - Thanks to the open-source community for tools and baselines.
+- Backbone: DINOv2 (Facebook AI Research)
+- Original DETR: Facebook AI Research

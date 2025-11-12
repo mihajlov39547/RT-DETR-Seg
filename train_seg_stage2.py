@@ -84,11 +84,16 @@ def find_stage1_checkpoint(stage1_run_dir):
     """Find the best checkpoint from stage 1 training."""
     run_path = Path(stage1_run_dir)
     
-    # Try common checkpoint names
+    # Try common checkpoint names (both .pt and .pth extensions)
     candidates = [
         run_path / "best.pt",
+        run_path / "best.pth",
+        run_path / "checkpoint_best_regular.pth",
+        run_path / "checkpoint_best_total.pth",
         run_path / "last.pt",
+        run_path / "last.pth",
         run_path / "checkpoint.pt",
+        run_path / "checkpoint.pth",
     ]
     
     for ckpt in candidates:
@@ -96,16 +101,16 @@ def find_stage1_checkpoint(stage1_run_dir):
             print(f"✓ Found Stage-1 checkpoint: {ckpt}")
             return ckpt
     
-    # List all .pt files if none of the common names found
-    pt_files = list(run_path.glob("*.pt"))
+    # List all .pt and .pth files if none of the common names found
+    pt_files = list(run_path.glob("*.pt")) + list(run_path.glob("*.pth"))
     if pt_files:
-        ckpt = pt_files[0]  # Take first .pt file
+        ckpt = pt_files[0]  # Take first checkpoint file
         print(f"⚠ Using checkpoint: {ckpt}")
         return ckpt
     
     raise FileNotFoundError(
         f"No checkpoint found in {stage1_run_dir}!\n"
-        f"Expected one of: {[c.name for c in candidates]}\n"
+        f"Expected one of: {[c.name for c in candidates[:8]]}\n"
         f"Please verify Stage-1 training completed successfully."
     )
 
@@ -115,7 +120,10 @@ def verify_frozen_detector(model):
     detector_params = []
     seg_head_params = []
     
-    for name, param in model.model.named_parameters():
+    # Access the actual PyTorch model
+    torch_model = model.model.model if hasattr(model.model, 'model') else model.model
+    
+    for name, param in torch_model.named_parameters():
         if "mask_head" in name or "bbox_attention" in name:
             seg_head_params.append((name, param.requires_grad))
         else:
@@ -294,6 +302,7 @@ def main():
         output_dir=str(run_dir),
         epochs=args.epochs,
         resolution=resolution,
+        model_size=size,  # Pass model size for mask head selection
         
         # CRITICAL: Load Stage-1 checkpoint and freeze detector
         frozen_weights=str(stage1_checkpoint),

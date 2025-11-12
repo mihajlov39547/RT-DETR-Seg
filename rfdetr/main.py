@@ -268,7 +268,9 @@ class Model:
         # Wrap with DETRsegm if masks are enabled
         if getattr(args, "masks", False) and not isinstance(model, DETRsegm):
             print("[fixup] Wrapping detector with DETRsegm (masks=True).")
-            model = DETRsegm(model, freeze_detr=freeze_intent).to(device)
+            # Extract model size from args if available
+            model_size = getattr(args, "model_size", "base")  # default to "base" if not specified
+            model = DETRsegm(model, freeze_detr=freeze_intent, size=model_size).to(device)
 
         # Keep model.detr.aux_loss unchanged; Stage-2 relies on aux supervision
 
@@ -1058,6 +1060,7 @@ def populate_args(
     lr_vit_layer_decay=0.8,
     lr_component_decay=1.0,
     do_benchmark=False,
+    model_size='base',  # Add model_size parameter
     
     # Drop parameters
     dropout=0,

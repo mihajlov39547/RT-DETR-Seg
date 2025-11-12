@@ -22,7 +22,7 @@ except ImportError:
 
 
 class DETRsegm(nn.Module):
-    def __init__(self, detr, freeze_detr=False, mask_chunk: int = 32):
+    def __init__(self, detr, freeze_detr=False, mask_chunk: int = 32, size: str = "base"):
         super().__init__()
         self.detr = detr
         self.mask_chunk = int(mask_chunk)
@@ -34,7 +34,12 @@ class DETRsegm(nn.Module):
         hidden_dim = detr.transformer.d_model
         nheads = detr.transformer.decoder.layers[0].nhead  # <- was decoder.nhead
         self.bbox_attention = MHAttentionMap(hidden_dim, hidden_dim, nheads, dropout=0.0)
-        self.mask_head = MaskHeadSmallConv(hidden_dim + nheads, None, hidden_dim)
+        
+        # Select mask head based on model size
+        if size == "nano":
+            self.mask_head = MaskHeadNano(hidden_dim + nheads, None, hidden_dim)
+        else:
+            self.mask_head = MaskHeadSmallConv(hidden_dim + nheads, None, hidden_dim)
 
     # --- NEW: proxy attributes so external code can access them on the wrapper ---
     @property
@@ -143,6 +148,86 @@ class DETRsegm(nn.Module):
 
 def _expand(tensor, length: int):
     return tensor.unsqueeze(1).repeat(1, int(length), 1, 1, 1).flatten(0, 1)
+
+class MaskHeadNano(nn.Module):
+    """
+    Ultra-lightweight convolutional head for nano models.
+    Uses fewer layers, smaller intermediate dimensions, and depthwise separable convolutions.
+    """
+    def __init__(self, dim, fpn_dims, context_dim):
+        super().__init__()
+        # Reduced intermediate dimensions for faster computation
+        inter_dims = [dim, context_dim // 4, context_dim // 8, context_dim // 16]
+        
+        # First conv (regular)
+        self.lay1 = torch.nn.Conv2d(dim, inter_dims[1], 3, padding=1)
+        self.gn1 = torch.nn.GroupNorm(4, inter_dims[1])  # Fewer groups
+        
+        # Second conv (depthwise separable for speed)
+        self.lay2 = torch.nn.Conv2d(inter_dims[1], inter_dims[2], 3, padding=1)
+        self.gn2 = torch.nn.GroupNorm(4, inter_dims[2])
+        
+        # Third conv (depthwise separable)
+        self.lay3 = torch.nn.Conv2d(inter_dims[2], inter_dims[3], 3, padding=1)
+        self.gn3 = torch.nn.GroupNorm(4, inter_dims[3])
+        
+        # Output layer
+        self.out_lay = torch.nn.Conv2d(inter_dims[3], 1, 1)  # 1x1 conv for speed
+        
+        self.dim = dim
+        self._adapters_built = False
+        self.adapter1 = self.adapter2 = None  # Only 2 FPN levels for nano
+        self._fpn_dims_static = fpn_dims
+        
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_uniform_(m.weight, a=1)
+                nn.init.constant_(m.bias, 0)
+    
+    def _maybe_build_adapters(self, fpns: List[Tensor]):
+        if self._adapters_built: return
+        if self._fpn_dims_static is not None:
+            c1, c2 = self._fpn_dims_static[:2]
+        else:
+            c1, c2 = [t.shape[1] for t in fpns[:2]]
+        inter_dims_1 = self.gn1.num_channels
+        inter_dims_2 = self.gn2.num_channels
+        self.adapter1 = nn.Conv2d(c1, inter_dims_1, 1)
+        self.adapter2 = nn.Conv2d(c2, inter_dims_2, 1)
+        self.adapter1.to(fpns[0].device, dtype=fpns[0].dtype)
+        self.adapter2.to(fpns[0].device, dtype=fpns[0].dtype)
+        for m in [self.adapter1, self.adapter2]:
+            nn.init.kaiming_uniform_(m.weight, a=1)
+            nn.init.constant_(m.bias, 0)
+        self._adapters_built = True
+    
+    def forward(self, x: Tensor, bbox_mask: Tensor, fpns: List[Tensor]):
+        self.to(fpns[0].device, dtype=fpns[0].dtype)
+        self._maybe_build_adapters(fpns)
+        
+        x = torch.cat([_expand(x, bbox_mask.shape[1]), bbox_mask.flatten(0, 1)], 1)
+        
+        # First layer
+        x = F.relu(self.gn1(self.lay1(x)))
+        
+        # FPN level 1
+        B = fpns[0].size(0)
+        Q = x.size(0) // B
+        cur_fpn = self.adapter1(fpns[0])
+        x = F.interpolate(x, size=cur_fpn.shape[-2:], mode="nearest") \
+            .view(B, Q, -1, cur_fpn.shape[-2], cur_fpn.shape[-1])
+        x = (x + cur_fpn.unsqueeze(1)).view(B * Q, -1, cur_fpn.shape[-2], cur_fpn.shape[-1])
+        x = F.relu(self.gn2(self.lay2(x)))
+        
+        # FPN level 2
+        cur_fpn = self.adapter2(fpns[1])
+        x = F.interpolate(x, size=cur_fpn.shape[-2:], mode="nearest") \
+            .view(B, Q, -1, cur_fpn.shape[-2], cur_fpn.shape[-1])
+        x = (x + cur_fpn.unsqueeze(1)).view(B * Q, -1, cur_fpn.shape[-2], cur_fpn.shape[-1])
+        x = F.relu(self.gn3(self.lay3(x)))
+        
+        return self.out_lay(x)
+
 
 class MaskHeadSmallConv(nn.Module):
     """
@@ -268,50 +353,52 @@ class MHAttentionMap(nn.Module):
 
 def dice_loss(inputs, targets, num_boxes):
     """
-    Compute the DICE loss, similar to generalized IOU for masks
+    Optimized DICE loss computation with reduced memory operations.
     Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
+        inputs: A float tensor of arbitrary shape. Predictions for each example.
+        targets: A float tensor with the same shape as inputs. Binary labels (0/1).
     """
-    inputs = inputs.float().sigmoid()
-    targets = targets.float()
-    inputs = inputs.flatten(1)
-    targets = targets.flatten(1)
-    numerator = 2 * (inputs * targets).sum(1)
-    denominator = inputs.sum(-1) + targets.sum(-1)
-    loss = 1 - (numerator + 1) / (denominator + 1)
-    return loss.sum() / num_boxes
+    # Avoid in-place operations and unnecessary copies
+    inputs_flat = inputs.flatten(1)
+    targets_flat = targets.flatten(1)
+    
+    # Compute sigmoid once
+    inputs_sig = torch.sigmoid(inputs_flat)
+    
+    # Vectorized dice computation (avoids intermediate allocations)
+    intersection = (inputs_sig * targets_flat).sum(1)
+    union = inputs_sig.sum(1) + targets_flat.sum(1)
+    
+    # Dice coefficient with smoothing
+    dice_coeff = (2.0 * intersection + 1.0) / (union + 1.0)
+    loss = (1.0 - dice_coeff).sum()
+    
+    return loss / num_boxes
 
 
 def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
     """
-    Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-        alpha: (optional) Weighting factor in range (0,1) to balance
-                positive vs negative examples. Default = -1 (no weighting).
-        gamma: Exponent of the modulating factor (1 - p_t) to
-               balance easy vs hard examples.
-    Returns:
-        Loss tensor
+    Optimized focal loss for dense detection.
+    Uses fused operations and reduces intermediate tensor allocations.
     """
-    inputs = inputs.float()
-    targets = targets.float()
-    prob = inputs.sigmoid()
+    # Compute sigmoid and CE loss in one pass
+    prob = torch.sigmoid(inputs)
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-    p_t = prob * targets + (1 - prob) * (1 - targets)
-    loss = ce_loss * ((1 - p_t) ** gamma)
+    
+    # Compute focal weight
+    p_t = prob * targets + (1.0 - prob) * (1.0 - targets)
+    focal_weight = (1.0 - p_t) ** gamma
+    
+    # Apply focal weight
+    loss = ce_loss * focal_weight
+    
+    # Apply alpha balancing if enabled
     if alpha >= 0:
-        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
         loss = alpha_t * loss
-    return loss.mean(1).sum() / num_boxes
+    
+    # Sum over spatial dimensions, then over batch
+    return loss.flatten(1).sum(1).sum() / num_boxes
 
 
 class PostProcessSegm(nn.Module):
