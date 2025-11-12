@@ -18,7 +18,7 @@ except Exception:
     pass
 
 # Make repo importable when running this file directly
-REPO_ROOT = Path(r"/content/drive/MyDrive/RT-DETR-Seg").resolve()
+REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -93,7 +93,7 @@ def main():
     ap.add_argument("--expanded_scales", type=str2bool, default=False, nargs="?", const=True,
                     help="use expanded scale set (accepts 0/1/true/false)")
     # comma-separated glob patterns to exclude when loading pretrain
-    ap.add_argument("--pretrain_exclude_keys", type=str, default="",
+    ap.add_argument("--pretrain_exclude_keys", type=str, default="backbone.0.projector.*",
                     help='comma-separated patterns to skip, e.g. "backbone.0.projector.*,transformer.*"')
     args = ap.parse_args()
 
@@ -116,7 +116,14 @@ def main():
 
     exclude_list = parse_patterns(args.pretrain_exclude_keys)
 
+    # Validate dataset exists
     train_ann = dataset_dir / "train" / "_annotations.coco.json"
+    if not train_ann.exists():
+        raise FileNotFoundError(
+            f"Training annotations not found: {train_ann}\n"
+            f"Expected structure: {dataset_dir}/train/_annotations.coco.json"
+        )
+    
     _, class_names = read_coco_categories(str(train_ann))
     num_classes = len(class_names)
     exclude_list = (exclude_list or []) + ["class_embed.*"]  # drop pretrained cls head
@@ -151,18 +158,26 @@ def main():
         run_test=False,                  # skip test pass to save memory/time
     )
 
-    print(len(class_names), "classes:", class_names)
-
-    print(f"==> Training {size} for {args.epochs} epoch(s) at {defaults['resolution']} on {device}")
-    print(f"    dataset_dir = {dataset_dir}")
-    print(f"    output_dir  = {run_dir}")
-    print(
-        "    "
-        f"batch={args.batch} accum={args.accum} workers={args.workers} "
-        f"amp={amp_enabled} aux_loss=False ema=False "
-        f"multi_scale={bool(args.multi_scale)} expanded_scales={bool(args.expanded_scales)} "
-        f"exclude_keys={exclude_list}"
-    )
+    print("\n" + "="*80)
+    print("STAGE 1: DETECTOR TRAINING")
+    print("="*80)
+    print(f"Model Size:       {size}")
+    print(f"Resolution:       {defaults['resolution']}")
+    print(f"Epochs:           {args.epochs}")
+    print(f"Device:           {device}")
+    print(f"Dataset:          {dataset_dir}")
+    print(f"Output:           {run_dir}")
+    print(f"Classes ({num_classes}):  {class_names}")
+    print("="*80)
+    print(f"Batch size:       {args.batch}")
+    print(f"Grad accumulation: {args.accum}")
+    print(f"Effective batch:  {args.batch * args.accum}")
+    print(f"Workers:          {args.workers}")
+    print(f"AMP:              {amp_enabled}")
+    print(f"Multi-scale:      {bool(args.multi_scale)}")
+    print(f"Expanded scales:  {bool(args.expanded_scales)}")
+    print(f"Exclude keys:     {exclude_list}")
+    print("="*80 + "\n")
 
     writer = SummaryWriter(str(run_dir / "tb"))
 
@@ -183,7 +198,7 @@ def main():
         num_classes=num_classes,
         class_names=class_names,
         do_random_resize_via_padding=False,
-        square_resize_div_64=True,
+        square_resize_div_64=(size in {"nano","small","medium"}),  # Consistent with model init
         lr_scheduler="cosine",
         warmup_epochs=0,
         run_test=False,
@@ -191,7 +206,13 @@ def main():
         tensorboard_writer=writer
     )
 
-    print(f"\nDone. Checkpoints/logs in: {run_dir}")
+    print("\n" + "="*80)
+    print("TRAINING COMPLETED")
+    print("="*80)
+    print(f"Checkpoints saved to: {run_dir}")
+    print(f"TensorBoard logs:     {run_dir / 'tb'}")
+    print(f"\nTo view training: tensorboard --logdir {run_dir / 'tb'}")
+    print("="*80 + "\n")
     writer.flush()
     writer.close()
 

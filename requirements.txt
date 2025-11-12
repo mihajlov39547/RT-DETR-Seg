@@ -1,17 +1,40 @@
+# Core ML Framework
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Computer Vision & Image Processing
 opencv-python-headless
-numpy
-matplotlib
 pillow
+supervision>=0.18.0
+
+# Scientific Computing
+numpy
 scipy
-tqdm
-pydantic>=2
-requests
-pycocotools
-onnx
-onnxsim
-onnxruntime
+matplotlib
+
+# Deep Learning Utilities
 transformers
 peft
-supervision
-roboflow
+timm
+
+# COCO Dataset & Evaluation
+pycocotools
+
+# ONNX Export
+onnx>=1.12.0
+# onnxsim>=0.4.0  # Requires cmake to build - install separately if needed: pip install onnxsim
+onnxruntime>=1.14.0
+
+# Data Validation & Configuration
+pydantic>=2.0
+
+# Utilities
+tqdm
+requests
+
+# Experiment Tracking (Optional)
+tensorboard
 wandb
+
+# Deployment (Optional)
+roboflow

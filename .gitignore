@@ -175,6 +175,5 @@ cython_debug/
 
 .idea/
 
-detr-env/
-dataset.coco-segmentation/
+dataset/
 runs/

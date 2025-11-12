@@ -1,79 +1,34 @@
 """
-train_seg_stage2.py
+train_seg_stage2.py - Stage 2: Train Segmentation Head with Frozen Detector
 
-Stage-2 segmentation training for RF-DETR.
+This script loads a trained detector checkpoint from Stage 1 and trains only
+the segmentation head while keeping the detector frozen.
 
-Overview:
----------
-Stage-2 is the second training phase. In Stage-1 you trained the detector
-(backbone + transformer + detection head) to predict boxes/classes.
-In Stage-2 we reuse those detector weights, wrap the model with `DETRsegm`,
-freeze the detector, and train only a new mask head to predict instance masks.
-
-Main features:
---------------
-- Loads a Stage-1 detector checkpoint (`--stage1_ckpt`).
-- Wraps with `DETRsegm`, adds a convolutional mask head.
-- Freezes detector weights (only mask head is trainable).
-- Trains with COCO-style instance masks (polygon/RLE).
-- Supports speed/VRAM control via `--num_queries`, `--mask_chunk`, etc.
-
-Important notes:
-----------------
-* Your dataset must be in COCO format with segmentation masks.
-* Class set and order must match Stage-1 (or training will fail).
-* By default, the detector is frozen (fine-tune only the mask head).
-* GTX 1650 Ti / 4 GB users should keep image res small (e.g. 256–384) and
-  reduce queries/chunk size for faster runs.
-
-Key arguments:
---------------
---size           Model size (nano/small/base/medium/large).
---stage1_ckpt    Path to Stage-1 checkpoint.
---output_dir     Where to save Stage-2 checkpoints/logs.
---resolution     Input image size (should match Stage-1).
---epochs         Number of epochs (default=50).
---batch          Micro-batch size.
---accum          Gradient accumulation steps.
---workers        Dataloader workers (set 0 on Windows).
---num_queries    Number of object queries (fewer = faster/less accurate).
---mask_chunk     Query chunk size in mask head (smaller = lower VRAM).
---multi_scale    Enable multi-scale augmentation (0/1).
---expanded_scales Enable expanded scale set (0/1).
-
-Usage examples:
----------------
-# Quick 1-epoch smoke run (faster, 200 iterations only):
-python train_seg_stage2.py --size nano --stage1_ckpt runs/detector_nano_384_2/checkpoint_best_total_2class.pth \
-    --output_dir smoke_seg --resolution 256 --epochs 1 --batch 1 --accum 1 --workers 0 \
-    --num_queries 100 --mask_chunk 16 --multi_scale 0 --expanded_scales 0
-
-# Full training run (frozen detector, 50 epochs at res=384):
-python train_seg_stage2.py --size nano --stage1_ckpt runs/detector_nano_384_2/checkpoint_best_total_2class.pth \
-    --output_dir output_seg_nano --resolution 384 --epochs 50 --batch 2 --accum 4 --workers 2
+Usage:
+python train_seg_stage2.py --size nano --stage1_run runs/detector_nano_384_1 --epochs 50 --batch 2 --accum 2 --workers 2
+python train_seg_stage2.py --size base --stage1_run runs/detector_base_560_1 --epochs 50 --batch 1 --accum 4 --workers 0
 """
-
-
-import argparse
-import json
-import os
+import sys, argparse
 from pathlib import Path
 import torch
-import torch.backends.cudnn as cudnn
-from rfdetr.models.segmentation import DETRsegm
+from itertools import count
+from torch.utils.tensorboard import SummaryWriter
 
-# Safe matmul precision
+# Safe matmul precision (no-op if unsupported)
 try:
     torch.set_float32_matmul_precision("high")
 except Exception:
     pass
-cudnn.benchmark = True  # faster on fixed input sizes
 
-# Core RF-DETR APIs
-from rfdetr.detr import RFDETRBase, RFDETRSmall, RFDETRMedium, RFDETRLarge, RFDETRNano
-from rfdetr.config import TrainConfig
+# Make repo importable when running this file directly
+REPO_ROOT = Path(__file__).resolve().parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-SIZES = {
+# Import RF-DETR model wrappers
+from rfdetr.detr import RFDETRNano, RFDETRSmall, RFDETRBase, RFDETRMedium, RFDETRLarge
+
+SIZE2CLS = {
     "nano":   RFDETRNano,
     "small":  RFDETRSmall,
     "base":   RFDETRBase,
@@ -81,173 +36,409 @@ SIZES = {
     "large":  RFDETRLarge,
 }
 
-def read_coco_categories(ann_path: str):
+# Handy defaults per size
+SIZE_DEFAULTS = {
+    "nano":   {"resolution": 384},
+    "small":  {"resolution": 512},
+    "base":   {"resolution": 560},
+    "medium": {"resolution": 576},
+    "large":  {"resolution": 560},
+}
+
+import json
+
+def read_coco_categories(ann_path):
+    """Read category information from COCO annotation file."""
     with open(ann_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     cats = sorted(data.get("categories", []), key=lambda c: c.get("id", 0))
+    cat_ids = [c["id"] for c in cats]
     class_names = [c["name"] for c in cats]
-    return class_names, len(class_names)
+    return cat_ids, class_names
 
-def parse_args():
-    p = argparse.ArgumentParser("RF-DETR Stage-2 (Segmentation Head) Trainer")
 
-    # Required
-    p.add_argument("--stage1_ckpt", type=str, required=True,
-                   help="Stage-1 detector checkpoint (e.g. runs/.../checkpoint_best_total.pth)")
+def validate_coco_has_masks(ann_path):
+    """Verify that the COCO annotation file contains segmentation masks."""
+    with open(ann_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    
+    annotations = data.get("annotations", [])
+    if not annotations:
+        raise ValueError(f"No annotations found in {ann_path}")
+    
+    # Check first 10 annotations for segmentation field
+    sample_size = min(10, len(annotations))
+    has_masks = sum(1 for ann in annotations[:sample_size] if "segmentation" in ann and ann["segmentation"])
+    
+    if has_masks == 0:
+        raise ValueError(
+            f"No segmentation masks found in {ann_path}!\n"
+            "Stage 2 requires instance segmentation annotations.\n"
+            "Your COCO JSON must have 'segmentation' field in annotations."
+        )
+    
+    print(f"✓ Validated: {has_masks}/{sample_size} sample annotations contain segmentation masks")
 
-    # Common
-    p.add_argument("--size", type=str, default="base", choices=list(SIZES.keys()))
-    p.add_argument("--output_dir", type=str, default="output_seg")
-    p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--resolution", type=int, default=560,
-                   help="Should match Stage-1 unless you know what you’re doing")
 
-    # Train hyperparams
-    p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--batch", type=int, default=2)
-    p.add_argument("--accum", type=int, default=4)
-    p.add_argument("--workers", type=int, default=2)
-    p.add_argument("--lr", type=float, default=5e-5, help="LR for mask head (detector frozen)")
-    p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--seed", type=int, default=42)
-
-    # Loss weights
-    p.add_argument("--mask_loss_coef", type=float, default=2.0)
-    p.add_argument("--dice_loss_coef", type=float, default=2.0)
-    p.add_argument("--freeze", type=int, default=1,
-               help="1 = freeze detector (mask head only), 0 = train detector + mask head")
-    p.add_argument("--cls_loss_coef", type=float, default=1.0)
-    p.add_argument("--bbox_loss_coef", type=float, default=5.0)
-    p.add_argument("--giou_loss_coef", type=float, default=2.0)
-
-    # Extras
-    p.add_argument("--ema", action="store_true", help="Use EMA for the (frozen) wrapper")
-    p.add_argument("--tensorboard", action="store_true")
-    p.add_argument("--eval_only", action="store_true", help="Just run validation once")
-    p.add_argument("--run_test", action="store_true", help="Evaluate on test split after training")
-
-    # Speed/compute knobs
-    p.add_argument("--num_queries", type=int, default=300, help="Number of object queries (default=300)")
-    p.add_argument("--mask_chunk", type=int, default=32, help="Chunk size for mask head forward (default=32)")
-    p.add_argument("--multi_scale", type=int, default=0, help="Enable multi-scale aug (0/1)")
-    p.add_argument("--expanded_scales", type=int, default=0, help="Enable expanded scales (0/1)")
-
-    return p.parse_args()
-
-def main():
-    args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    dataset_dir = Path(r"/content/drive/MyDrive/RT-DETR-Seg/dataset").resolve()
-    train_ann = dataset_dir / "train" / "_annotations.coco.json"
-    if not train_ann.exists():
-        raise FileNotFoundError(f"Missing annotations: {train_ann}")
-
-    # Require masks present
-    with open(train_ann, "r", encoding="utf-8") as f:
-        anns = json.load(f)
-    if not any(a.get("segmentation") for a in anns.get("annotations", [])):
-        raise ValueError("This Stage-2 script requires instance masks.")
-
-    # Read classes
-    class_names, num_classes = read_coco_categories(str(train_ann))
-
-    # Stage-1 checkpoint sanity check (class count)
-    try:
-        ckpt = torch.load(args.stage1_ckpt, map_location="cpu", weights_only=False)
-        state = ckpt.get("model") or ckpt.get("ema_model") or {}
-        ckpt_args = ckpt.get("args", None)
-        cls_bias_key = next((k for k in state.keys() if k.endswith("class_embed.bias")), None)
-        if cls_bias_key is not None:
-            ckpt_out = int(state[cls_bias_key].shape[0])   # includes background
-            ds_out   = int(num_classes + 1)
-            if ckpt_out != ds_out:
-                raise ValueError(
-                    f"Stage-1 checkpoint classes ({ckpt_out-1}) != dataset classes ({num_classes})."
-                )
-    except Exception:
-        pass
-
-    # Build base RF-DETR
-    ModelCls = SIZES[args.size]
-    # decide freezing: only freeze if --freeze=1
-    _frozen = args.stage1_ckpt if args.freeze == 1 else None
-    # prefer Stage-1 architecture settings when present
-    def _get(k, default):
-        return getattr(ckpt_args, k, default) if ckpt_args is not None else default
-    model = ModelCls(
-        resolution=_get("resolution", args.resolution),
-        masks=True,
-        frozen_weights=_frozen,
-        device=args.device,
-        num_classes=num_classes,
-        class_names=class_names,
-        aux_loss=True,  # enable decoder aux supervision for seg
-        num_queries=_get("num_queries", args.num_queries),
-        # out_feature_indexes=_get("out_feature_indexes", None),
-        # projector_scale=_get("projector_scale", None),
-        # position_embedding=_get("position_embedding", None),
-        multi_scale=bool(args.multi_scale),
-        expanded_scales=bool(args.expanded_scales),
+def find_stage1_checkpoint(stage1_run_dir):
+    """Find the best checkpoint from stage 1 training."""
+    run_path = Path(stage1_run_dir)
+    
+    # Try common checkpoint names
+    candidates = [
+        run_path / "best.pt",
+        run_path / "last.pt",
+        run_path / "checkpoint.pt",
+    ]
+    
+    for ckpt in candidates:
+        if ckpt.exists():
+            print(f"✓ Found Stage-1 checkpoint: {ckpt}")
+            return ckpt
+    
+    # List all .pt files if none of the common names found
+    pt_files = list(run_path.glob("*.pt"))
+    if pt_files:
+        ckpt = pt_files[0]  # Take first .pt file
+        print(f"⚠ Using checkpoint: {ckpt}")
+        return ckpt
+    
+    raise FileNotFoundError(
+        f"No checkpoint found in {stage1_run_dir}!\n"
+        f"Expected one of: {[c.name for c in candidates]}\n"
+        f"Please verify Stage-1 training completed successfully."
     )
 
-    freeze_intent = (args.freeze == 1)
-    inner = model.model.model
-    if not isinstance(inner, DETRsegm):
-        print("[stage-2] Wrapping base detector with DETRsegm.")
-        model.model.model = DETRsegm(inner, freeze_detr=freeze_intent,
-                                     mask_chunk=args.mask_chunk).to(model.model.device)
 
-    # Train config
-    tcfg = TrainConfig(
+def verify_frozen_detector(model):
+    """Verify that detector parameters are frozen and only seg head is trainable."""
+    detector_params = []
+    seg_head_params = []
+    
+    for name, param in model.model.named_parameters():
+        if "mask_head" in name or "bbox_attention" in name:
+            seg_head_params.append((name, param.requires_grad))
+        else:
+            detector_params.append((name, param.requires_grad))
+    
+    # Check detector is frozen
+    frozen_count = sum(1 for _, req_grad in detector_params if not req_grad)
+    trainable_count = sum(1 for _, req_grad in detector_params if req_grad)
+    
+    if trainable_count > 0:
+        print(f"⚠ WARNING: {trainable_count} detector parameters are trainable!")
+        print("  Detector should be frozen in Stage-2. Check frozen_weights parameter.")
+    else:
+        print(f"✓ Detector frozen: {frozen_count} parameters")
+    
+    # Check seg head is trainable
+    seg_trainable = sum(1 for _, req_grad in seg_head_params if req_grad)
+    seg_frozen = sum(1 for _, req_grad in seg_head_params if not req_grad)
+    
+    if seg_trainable == 0:
+        raise RuntimeError(
+            "ERROR: Segmentation head has no trainable parameters!\n"
+            "Check that masks=True and freeze_detr is properly set."
+        )
+    
+    print(f"✓ Segmentation head trainable: {seg_trainable} parameters (frozen: {seg_frozen})")
+    
+    return {
+        "detector_frozen": frozen_count,
+        "detector_trainable": trainable_count,
+        "seg_head_trainable": seg_trainable,
+        "seg_head_frozen": seg_frozen,
+    }
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected boolean/0/1, got '{v}'")
+
+
+def pick_amp_for_gpu():
+    """Use fp16 on pre-Ampere (like GTX 1650 Ti), bf16 on Ampere+."""
+    if not torch.cuda.is_available():
+        return True, "cpu"  # enable AMP anyway; engine guards it safely
+    major, minor = torch.cuda.get_device_capability()
+    # Pre-Ampere (<8.0) → float16; Ampere+ → bfloat16 (engine picks dtype)
+    return True, "cuda"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Stage 2: Train segmentation head with frozen detector")
+    
+    # Required
+    ap.add_argument("--size", choices=["nano","small","base","medium","large"], required=True,
+                    help="Model size (must match Stage-1)")
+    ap.add_argument("--stage1_run", type=str, required=True,
+                    help="Path to Stage-1 run directory (e.g., runs/detector_nano_384_1)")
+    
+    # Training params
+    ap.add_argument("--epochs", type=int, default=50,
+                    help="Number of epochs to train segmentation head")
+    ap.add_argument("--batch",  type=int, default=2,
+                    help="Batch size per step (segmentation needs more memory)")
+    ap.add_argument("--accum",  type=int, default=2,
+                    help="Gradient accumulation steps")
+    ap.add_argument("--workers",type=int, default=2,
+                    help="Number of dataloader workers")
+    ap.add_argument("--no_amp", action="store_true",
+                    help="Disable mixed precision training")
+    
+    # Segmentation-specific
+    ap.add_argument("--seg_lr", type=float, default=1e-4,
+                    help="Learning rate for segmentation head (lower than detector)")
+    ap.add_argument("--mask_loss_coef", type=float, default=1.0,
+                    help="Weight for mask loss")
+    ap.add_argument("--dice_loss_coef", type=float, default=1.0,
+                    help="Weight for dice loss")
+    
+    # Data augmentation
+    ap.add_argument("--multi_scale", type=str2bool, default=True, nargs="?", const=True,
+                    help="Use multi-scale training")
+    ap.add_argument("--expanded_scales", type=str2bool, default=False, nargs="?", const=True,
+                    help="Use expanded scale set")
+    
+    # Optional overrides
+    ap.add_argument("--resolution", type=int, default=None,
+                    help="Override resolution (default: use Stage-1 resolution)")
+    ap.add_argument("--checkpoint", type=str, default=None,
+                    help="Specific checkpoint file to load (default: auto-find best.pt)")
+    ap.add_argument("--run_test", type=str2bool, default=True, nargs="?", const=True,
+                    help="Run test evaluation after training")
+    
+    args = ap.parse_args()
+    
+    # =========================================================================
+    # SETUP
+    # =========================================================================
+    
+    size = args.size
+    ModelCls = SIZE2CLS[size]
+    defaults = SIZE_DEFAULTS[size]
+    
+    # Determine resolution
+    resolution = args.resolution if args.resolution else defaults["resolution"]
+    
+    # Find Stage-1 checkpoint
+    stage1_run_dir = Path(args.stage1_run)
+    if not stage1_run_dir.exists():
+        raise FileNotFoundError(f"Stage-1 run directory not found: {stage1_run_dir}")
+    
+    if args.checkpoint:
+        stage1_checkpoint = Path(args.checkpoint)
+        if not stage1_checkpoint.exists():
+            raise FileNotFoundError(f"Specified checkpoint not found: {stage1_checkpoint}")
+    else:
+        stage1_checkpoint = find_stage1_checkpoint(stage1_run_dir)
+    
+    # Setup paths
+    dataset_dir = REPO_ROOT / "dataset"
+    base_name = f"segmentation_{size}_{resolution}"
+    for i in count(1):
+        candidate = REPO_ROOT / "runs" / f"{base_name}_{i}"
+        if not candidate.exists():
+            run_dir = candidate
+            break
+    
+    run_dir.mkdir(parents=True, exist_ok=True)
+    
+    # AMP setup
+    amp_enabled, device = pick_amp_for_gpu()
+    if args.no_amp:
+        amp_enabled = False
+    
+    # =========================================================================
+    # VALIDATION
+    # =========================================================================
+    
+    print("\n" + "="*80)
+    print("STAGE 2: SEGMENTATION HEAD TRAINING")
+    print("="*80)
+    print(f"Model Size:       {size}")
+    print(f"Resolution:       {resolution}")
+    print(f"Stage-1 Checkpoint: {stage1_checkpoint}")
+    print(f"Output Directory: {run_dir}")
+    print(f"Device:           {device}")
+    print(f"AMP:              {amp_enabled}")
+    print("="*80 + "\n")
+    
+    # Validate dataset has mask annotations
+    train_ann = dataset_dir / "train" / "_annotations.coco.json"
+    if not train_ann.exists():
+        raise FileNotFoundError(f"Training annotations not found: {train_ann}")
+    
+    validate_coco_has_masks(train_ann)
+    
+    # Read class information
+    _, class_names = read_coco_categories(str(train_ann))
+    num_classes = len(class_names)
+    print(f"Number of classes: {num_classes}")
+    print(f"Classes: {class_names}\n")
+    
+    # =========================================================================
+    # MODEL SETUP
+    # =========================================================================
+    
+    print("Initializing model with frozen detector...")
+    
+    model = ModelCls(
         dataset_dir=str(dataset_dir),
-        output_dir=args.output_dir,
+        output_dir=str(run_dir),
         epochs=args.epochs,
+        resolution=resolution,
+        
+        # CRITICAL: Load Stage-1 checkpoint and freeze detector
+        frozen_weights=str(stage1_checkpoint),
+        masks=True,  # Enable segmentation head
+        
+        # Class information
+        num_classes=num_classes,
+        class_names=class_names,
+        
+        # Training hyperparameters (adjusted for seg head training)
+        lr=args.seg_lr,  # Lower LR for fine-tuning seg head
         batch_size=args.batch,
         grad_accum_steps=args.accum,
         num_workers=args.workers,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        tensorboard=args.tensorboard,
-        use_ema=args.ema,
-        run_test=args.run_test and (not args.eval_only),
-        aux_loss=True,
-        # losses
-        cls_loss_coef=args.cls_loss_coef,
-        bbox_loss_coef=args.bbox_loss_coef,
-        giou_loss_coef=args.giou_loss_coef,
-        mask_loss_coef=args.mask_loss_coef,
-        dice_loss_coef=args.dice_loss_coef,
-        masks=True,
-        frozen_weights=_frozen,
-        class_names=class_names,
-        square_resize_div_64=True,
-        # keep lightweight by default
+        
+        # Memory management
+        amp=amp_enabled,
+        use_ema=False,  # Disable EMA to save memory
+        aux_loss=True,  # Keep auxiliary losses for better training
+        
+        # Data augmentation
         multi_scale=bool(args.multi_scale),
         expanded_scales=bool(args.expanded_scales),
         do_random_resize_via_padding=False,
-        # housekeeping
-        seed=args.seed,
+        square_resize_div_64=(size in {"nano","small","medium"}),
+        
+        # Loss weights
+        mask_loss_coef=args.mask_loss_coef,
+        dice_loss_coef=args.dice_loss_coef,
+        
+        # Training settings
+        lr_scheduler="cosine",
+        warmup_epochs=5,  # Short warmup for seg head
         early_stopping=True,
-        early_stopping_patience=10,
-        early_stopping_min_delta=0.001,
-        early_stopping_use_ema=False,
+        patience=10,  # Stop if no improvement for 10 epochs
+        
+        device=device,
+        run_test=bool(args.run_test),
     )
-
-    if args.eval_only:
-        model.model.args.eval = True
-        model.train_from_config(tcfg, eval=True, run_test=False)
-        return
-
-    print(f"==> Stage-2 (seg) training on {args.device} | size={args.size} | res={args.resolution}")
-    print(f"    dataset_dir={dataset_dir}")
-    print(f"    stage1_ckpt={args.stage1_ckpt}")
-    print(f"    classes({num_classes})={class_names}")
     
-    model.train_from_config(tcfg)
+    # =========================================================================
+    # VERIFICATION
+    # =========================================================================
+    
+    print("\nVerifying model configuration...")
+    param_stats = verify_frozen_detector(model)
+    
+    # Save configuration
+    config_path = run_dir / "stage2_config.json"
+    import json
+    with open(config_path, "w") as f:
+        json.dump({
+            "stage": 2,
+            "size": size,
+            "resolution": resolution,
+            "stage1_checkpoint": str(stage1_checkpoint),
+            "epochs": args.epochs,
+            "batch_size": args.batch,
+            "grad_accum": args.accum,
+            "learning_rate": args.seg_lr,
+            "amp_enabled": amp_enabled,
+            "device": device,
+            "num_classes": num_classes,
+            "class_names": class_names,
+            "param_stats": param_stats,
+            "args": vars(args),
+        }, f, indent=2)
+    print(f"✓ Configuration saved to: {config_path}\n")
+    
+    # =========================================================================
+    # TRAINING
+    # =========================================================================
+    
+    print("="*80)
+    print("STARTING TRAINING")
+    print("="*80)
+    print(f"Epochs:           {args.epochs}")
+    print(f"Batch size:       {args.batch}")
+    print(f"Grad accumulation: {args.accum}")
+    print(f"Effective batch:  {args.batch * args.accum}")
+    print(f"Learning rate:    {args.seg_lr}")
+    print(f"Workers:          {args.workers}")
+    print(f"Multi-scale:      {bool(args.multi_scale)}")
+    print("="*80 + "\n")
+    
+    writer = SummaryWriter(str(run_dir / "tb"))
+    
+    try:
+        # Kick off training
+        model.train(
+            dataset_dir=str(dataset_dir),
+            epochs=args.epochs,
+            batch_size=args.batch,
+            grad_accum_steps=args.accum,
+            num_workers=args.workers,
+            output_dir=str(run_dir),
+            
+            # Model config
+            frozen_weights=str(stage1_checkpoint),
+            masks=True,
+            num_classes=num_classes,
+            class_names=class_names,
+            
+            # Training settings
+            lr=args.seg_lr,
+            amp=amp_enabled,
+            aux_loss=True,
+            use_ema=False,
+            multi_scale=bool(args.multi_scale),
+            expanded_scales=bool(args.expanded_scales),
+            
+            # Loss weights
+            mask_loss_coef=args.mask_loss_coef,
+            dice_loss_coef=args.dice_loss_coef,
+            
+            # Other settings
+            do_random_resize_via_padding=False,
+            square_resize_div_64=(size in {"nano","small","medium"}),
+            lr_scheduler="cosine",
+            warmup_epochs=5,
+            run_test=bool(args.run_test),
+            
+            tensorboard_writer=writer
+        )
+        
+        print("\n" + "="*80)
+        print("TRAINING COMPLETED SUCCESSFULLY")
+        print("="*80)
+        print(f"Checkpoints saved to: {run_dir}")
+        print(f"TensorBoard logs: {run_dir / 'tb'}")
+        print(f"\nTo visualize training: tensorboard --logdir {run_dir / 'tb'}")
+        print("="*80 + "\n")
+        
+    except Exception as e:
+        print(f"\n{'='*80}")
+        print("ERROR DURING TRAINING")
+        print("="*80)
+        print(f"{type(e).__name__}: {e}")
+        print("="*80 + "\n")
+        raise
+    
+    finally:
+        writer.flush()
+        writer.close()
 
-    print("\nStage-2 training complete.")
-    print(f"Artifacts in: {args.output_dir}")
 
 if __name__ == "__main__":
     main()
